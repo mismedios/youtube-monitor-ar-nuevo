@@ -27,7 +27,7 @@ def init_db():
 
 def enviar_telegram(mensaje, foto_path=None, archivo_path=None):
     # La palabra "bot" debe ir pegada a la URL y ANTES del token
-    base_url = f"https://api.telegram.org{TELEGRAM_TOKEN}"
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     
     try:
         # 1. Enviar Foto
