@@ -9,16 +9,16 @@ from datetime import datetime
 from googleapiclient.discovery import build
 
 # --- CONFIGURACIÓN ---
-# Las llaves se leen de GitHub Secrets por seguridad
-API_KEY = os.getenv('YT_API_KEY')
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+# Usamos .strip() para limpiar espacios invisibles de los Secrets de GitHub
+API_KEY = os.getenv('YT_API_KEY', '').strip()
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 
-# ID del canal (asegurate que sea el correcto entre comillas)
+# ID de tu canal
 CHANNEL_ID = 'UC1Tw7oE-tWiA3qXEPpq9SWQ' 
 
 DB_NAME = "stats_history.db"
-UMBRAL_VIRAL = 10000 # Alerta si un video sube >10k vistas en 24hs
+UMBRAL_VIRAL = 10000 
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -30,52 +30,58 @@ def init_db():
     conn.close()
 
 def enviar_telegram(mensaje, foto_path=None, archivo_path=None):
-    # IMPORTANTE: La URL debe incluir 'bot' antes del token
+    # URL corregida con /bot al principio
     base_url = f"https://api.telegram.org{TELEGRAM_TOKEN}"
     
-    # 1. Enviar Foto con epígrafe
-    if foto_path:
-        with open(foto_path, 'rb') as f:
-            requests.post(f"{base_url}/sendPhoto", 
-                          data={'chat_id': TELEGRAM_CHAT_ID, 'caption': mensaje, 'parse_mode': 'Markdown'}, 
-                          files={'photo': f})
-    else:
-        requests.post(f"{base_url}/sendMessage", 
-                      data={'chat_id': TELEGRAM_CHAT_ID, 'text': mensaje, 'parse_mode': 'Markdown'})
-    
-    # 2. Enviar Excel si existe
-    if archivo_path:
-        with open(archivo_path, 'rb') as f:
-            requests.post(f"{base_url}/sendDocument", data={'chat_id': TELEGRAM_CHAT_ID}, files={'document': f})
+    try:
+        # 1. Enviar Foto con el resumen como epígrafe
+        if foto_path:
+            with open(foto_path, 'rb') as f:
+                r = requests.post(f"{base_url}/sendPhoto", 
+                              data={'chat_id': TELEGRAM_CHAT_ID, 'caption': mensaje, 'parse_mode': 'Markdown'}, 
+                              files={'photo': f})
+                print(f"Respuesta Telegram Foto: {r.status_code}")
+        else:
+            r = requests.post(f"{base_url}/sendMessage", 
+                          data={'chat_id': TELEGRAM_CHAT_ID, 'text': mensaje, 'parse_mode': 'Markdown'})
+            print(f"Respuesta Telegram Texto: {r.status_code}")
+        
+        # 2. Enviar Excel si se generó
+        if archivo_path:
+            with open(archivo_path, 'rb') as f:
+                requests.post(f"{base_url}/sendDocument", data={'chat_id': TELEGRAM_CHAT_ID}, files={'document': f})
+                
+    except Exception as e:
+        print(f"❌ Error al enviar a Telegram: {e}")
 
 def git_push_db():
     try:
         subprocess.run(["git", "config", "--global", "user.name", "YouTube Bot AR"], check=True)
         subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=True)
         subprocess.run(["git", "add", DB_NAME], check=True)
-        subprocess.run(["git", "commit", "-m", f"🔄 Update DB: {datetime.now().date()}"], check=True)
+        subprocess.run(["git", "commit", "-m", f"🔄 Historial actualizado: {datetime.now().date()}"], check=True)
         subprocess.run(["git", "push"], check=True)
         print("📦 Base de datos sincronizada con GitHub.")
     except Exception as e:
-        print(f"⚠️ Git Push saltado (posiblemente sin cambios): {e}")
+        print("ℹ️ No hay cambios en la base de datos para subir.")
 
 def obtener_datos_youtube():
     youtube = build('youtube', 'v3', developerKey=API_KEY)
     
-    # Obtener Playlist de "Uploads" (todos los videos del canal)
+    # Obtener Playlist de Uploads
     ch_res = youtube.channels().list(id=CHANNEL_ID, part='contentDetails').execute()
     uploads_id = ch_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
-    # Listar IDs de los últimos videos (paginación)
+    # Listar IDs de videos
     video_ids = []
     next_page = None
-    for _ in range(4): # Trae hasta 200 videos
+    for _ in range(4): # Últimos 200 videos
         res = youtube.playlistItems().list(playlistId=uploads_id, part='contentDetails', maxResults=50, pageToken=next_page).execute()
         video_ids.extend([item['contentDetails']['videoId'] for item in res['items']])
         next_page = res.get('nextPageToken')
         if not next_page: break
 
-    # Obtener métricas reales en lotes de 50
+    # Obtener métricas en lotes
     datos_videos = []
     for i in range(0, len(video_ids), 50):
         v_res = youtube.videos().list(id=','.join(video_ids[i:i+50]), part='statistics,snippet').execute()
@@ -85,7 +91,7 @@ def obtener_datos_youtube():
                 'Título': item['snippet']['title'],
                 'Vistas': int(item['statistics'].get('viewCount', 0)),
                 'Likes': int(item['statistics'].get('likeCount', 0)),
-                'URL': f"https://youtu.be{item['id']}" # Corregido con barra
+                'URL': f"https://youtu.be{item['id']}"
             })
     return pd.DataFrame(datos_videos)
 
@@ -94,7 +100,7 @@ def procesar_metricas(df_hoy):
     fecha_hoy = datetime.now().date().isoformat()
     cursor = conn.cursor()
     
-    # --- 1. Crecimiento Total ---
+    # --- 1. Canal ---
     vistas_totales_hoy = df_hoy['Vistas'].sum()
     cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
     row = cursor.fetchone()
@@ -102,7 +108,7 @@ def procesar_metricas(df_hoy):
     crecimiento_total = vistas_totales_hoy - vistas_ayer
     conn.execute("INSERT INTO canal_history VALUES (?, ?)", (fecha_hoy, vistas_totales_hoy))
 
-    # --- 2. Crecimiento por Video ---
+    # --- 2. Videos ---
     df_hoy['Crecimiento'] = 0
     alertas_virales = []
     
@@ -125,21 +131,20 @@ def procesar_metricas(df_hoy):
     return crecimiento_total, alertas_virales
 
 def generar_grafico(df):
-    # Filtrar solo videos con crecimiento > 0 para el gráfico
-    top_5 = df[df['Crecimiento'] > 0].sort_values(by='Crecimiento', ascending=False).head(5)
+    top_5 = df[df['Crecimiento'] >= 0].sort_values(by='Crecimiento', ascending=False).head(5)
     
-    if top_5.empty:
-        # Si no hay datos históricos aún, mostrar los más vistos
+    # Si es la primera vez que corre, graficar por vistas totales
+    if top_5['Crecimiento'].sum() == 0:
         top_5 = df.sort_values(by='Vistas', ascending=False).head(5)
-        titulo_graf = "Videos más vistos (Sin historial previo)"
         col_x = 'Vistas'
+        tit = "Videos más vistos (Primer Reporte)"
     else:
-        titulo_graf = f"Top Crecimiento Diario - {datetime.now().strftime('%d/%m')}"
         col_x = 'Crecimiento'
+        tit = f"Crecimiento Diario - {datetime.now().strftime('%d/%m')}"
 
     plt.figure(figsize=(10, 6))
     sns.barplot(x=col_x, y=top_5['Título'].str[:35], data=top_5, palette='magma')
-    plt.title(titulo_graf)
+    plt.title(tit)
     path = "grafico_hoy.png"
     plt.tight_layout()
     plt.savefig(path)
@@ -149,31 +154,27 @@ def generar_grafico(df):
 def main():
     try:
         init_db()
-        df = obtener_datos_youtube()
-        crecimiento_total, virales = procesar_metricas(df)
+        df_hoy = obtener_datos_youtube()
+        crecimiento_total, virales = procesar_metricas(df_hoy)
         
         # Generar archivos
         excel_path = f"reporte_yt_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        df.to_excel(excel_path, index=False)
-        grafico_path = generar_grafico(df)
+        df_hoy.to_excel(excel_path, index=False)
+        grafico_path = generar_grafico(df_hoy)
 
-        # Mensaje Final
-        virales_txt = "\n".join(virales) if virales else "Sin alertas de viralidad hoy."
-        resumen = (f"🇦🇷 *REPORTE YOUTUBE AR*\n"
-                   f"📅 {datetime.now().strftime('%d/%m/%Y')}\n\n"
-                   f"📈 *Vistas Totales:* {df['Vistas'].sum():,}\n"
-                   f"🔥 *Crecimiento 24hs:* +{crecimiento_total:,}\n\n"
-                   f"*Alertas:*\n{virales_txt}")
+        # Mensaje de Telegram
+        txt_virales = "\n".join(virales) if virales else "Sin picos de viralidad hoy."
+        resumen = (f"🇦🇷 *REPORTE ARGENTINA*\n"
+                   f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+                   f"📊 *Vistas Totales:* {df_hoy['Vistas'].sum():,}\n"
+                   f"📈 *Crecimiento 24h:* +{crecimiento_total:,}\n\n"
+                   f"*Alertas Virales:*\n{txt_virales}")
         
         enviar_telegram(resumen, foto_path=grafico_path, archivo_path=excel_path)
         git_push_db()
-        print("🚀 Proceso completado con éxito.")
         
     except Exception as e:
-        error_msg = f"❌ *Error en el Script:* {str(e)}"
-        print(error_msg)
-        # Opcional: enviar error a Telegram para avisarte
-        # requests.post(f"https://api.telegram.org{TELEGRAM_TOKEN}/sendMessage", data={'chat_id': TELEGRAM_CHAT_ID, 'text': error_msg})
+        print(f"Ocurrió un error: {e}")
 
 if __name__ == "__main__":
     main()
