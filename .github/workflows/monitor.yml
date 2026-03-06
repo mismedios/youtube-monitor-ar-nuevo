@@ -1,0 +1,34 @@
+name: Monitor YouTube Argentina Histórico
+on:
+  schedule:
+    - cron: '0 12 * * *' # 09:00 AM Argentina
+  workflow_dispatch:
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    # PERMISOS PARA QUE EL BOT PUEDA HACER PUSH
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Descarga todo el historial para evitar conflictos de Git
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Instalar dependencias
+        run: pip install pandas openpyxl google-api-python-client requests
+
+      - name: Ejecutar Script y Guardar Cambios
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Token automático de GitHub
+        run: python tu_script.py
