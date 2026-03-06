@@ -23,7 +23,8 @@ jobs:
           python-version: '3.9'
 
       - name: Instalar dependencias
-        run: pip install pandas openpyxl google-api-python-client requests
+        # Se agregaron matplotlib y seaborn a la lista de instalación
+        run: pip install pandas openpyxl google-api-python-client requests matplotlib seaborn
 
       - name: Ejecutar Script y Guardar Cambios
         env:
