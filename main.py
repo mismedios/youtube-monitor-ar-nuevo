@@ -21,7 +21,8 @@ UMBRAL_VIRAL = 10000
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     conn.execute('''CREATE TABLE IF NOT EXISTS canal_history (fecha TEXT, vistas_totales INTEGER)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS video_history (video_id TEXT, titulo TEXT, vistas INTEGER, fecha TEXT)''')
+    # Actualizamos la estructura para incluir likes y comentarios
+    conn.execute('''CREATE TABLE IF NOT EXISTS video_history (video_id TEXT, titulo TEXT, vistas INTEGER, likes INTEGER, comentarios INTEGER, fecha TEXT)''')
     conn.commit()
     conn.close()
 
@@ -100,7 +101,6 @@ def procesar_metricas(df_hoy, reintentos=1):
         cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
         row = cursor.fetchone()
         
-        # Leemos el dato; si es basura binaria, aquí saltará el ValueError
         vistas_ayer = int(row[0]) if row else vistas_totales_hoy
         crecimiento_total = vistas_totales_hoy - vistas_ayer
         
@@ -108,46 +108,61 @@ def procesar_metricas(df_hoy, reintentos=1):
 
         # --- 2. Crecimiento por Video ---
         df_hoy['Crecimiento'] = 0
+        df_hoy['Crec_Likes'] = 0
+        df_hoy['Crec_Comentarios'] = 0
         alertas = []
         
+        # --- UMBRALES DE ALERTAS (Ajustalos a tu gusto) ---
+        UMBRAL_LIKES = 500
+        UMBRAL_COMENTARIOS = 100
+        
         for idx, row_v in df_hoy.iterrows():
-            cursor.execute("SELECT vistas FROM video_history WHERE video_id=? ORDER BY fecha DESC LIMIT 1", (row_v['ID'],))
+            # Ahora pedimos vistas, likes y comentarios
+            cursor.execute("SELECT vistas, likes, comentarios FROM video_history WHERE video_id=? ORDER BY fecha DESC LIMIT 1", (row_v['ID'],))
             res_v = cursor.fetchone()
             
             if res_v:
-                # Si el registro del video está corrupto, también saltará aquí
                 vistas_ayer_v = int(res_v[0])
-                diff = int(row_v['Vistas']) - vistas_ayer_v
-                df_hoy.at[idx, 'Crecimiento'] = diff
+                likes_ayer_v = int(res_v[1]) if res_v[1] is not None else int(row_v['Me Gusta'])
+                comentarios_ayer_v = int(res_v[2]) if res_v[2] is not None else int(row_v['Comentarios'])
                 
-                if diff >= UMBRAL_VIRAL:
-                    alertas.append(f"🚀 *VIRAL:* {row_v['Título']} (+{diff:,} vistas)")
+                diff_vistas = int(row_v['Vistas']) - vistas_ayer_v
+                diff_likes = int(row_v['Me Gusta']) - likes_ayer_v
+                diff_comentarios = int(row_v['Comentarios']) - comentarios_ayer_v
+                
+                df_hoy.at[idx, 'Crecimiento'] = diff_vistas
+                df_hoy.at[idx, 'Crec_Likes'] = diff_likes
+                df_hoy.at[idx, 'Crec_Comentarios'] = diff_comentarios
+                
+                # Generación de Alertas Múltiples
+                if diff_vistas >= UMBRAL_VIRAL:
+                    alertas.append(f"🚀 *VIRAL:* {row_v['Título']} (+{diff_vistas:,} vistas)")
+                if diff_likes >= UMBRAL_LIKES:
+                    alertas.append(f"❤️ *LLUVIA DE LIKES:* {row_v['Título']} (+{diff_likes:,} likes)")
+                if diff_comentarios >= UMBRAL_COMENTARIOS:
+                    alertas.append(f"💬 *DEBATE INTENSO:* {row_v['Título']} (+{diff_comentarios:,} comentarios)")
             
-            conn.execute("INSERT INTO video_history VALUES (?, ?, ?, ?)", 
-                         (row_v['ID'], row_v['Título'], int(row_v['Vistas']), fecha_hoy))
+            # Guardamos el registro con los 5 datos ahora
+            conn.execute("INSERT INTO video_history VALUES (?, ?, ?, ?, ?, ?)", 
+                         (row_v['ID'], row_v['Título'], int(row_v['Vistas']), int(row_v['Me Gusta']), int(row_v['Comentarios']), fecha_hoy))
         
         conn.commit()
         conn.close()
         return crecimiento_total, alertas
 
-    except (ValueError, sqlite3.DatabaseError) as e:
-        # Si ocurre un error por corrupción, cerramos la conexión para liberar el archivo
+    # Agregamos sqlite3.OperationalError para que atrape el error de esquema viejo y resetee
+    except (ValueError, sqlite3.DatabaseError, sqlite3.OperationalError) as e:
         conn.close()
         
         if reintentos > 0:
-            print(f"⚠️ BD corrupta detectada ({e}). Eliminando y reseteando...")
+            print(f"⚠️ BD corrupta o desactualizada detectada ({e}). Eliminando y reseteando...")
             
-            # Eliminamos el archivo corrupto
             if os.path.exists(DB_NAME):
                 os.remove(DB_NAME)
             
-            # Volvemos a crear las tablas desde cero
             init_db()
-            
-            # Reintentamos el proceso (pasando reintentos=0 para no hacer un bucle infinito)
             return procesar_metricas(df_hoy, reintentos=0)
         else:
-            # Si falla incluso después de limpiarlo, lanzamos la excepción
             raise Exception(f"Fallo crítico al procesar métricas tras resetear la BD: {e}")
 
 
