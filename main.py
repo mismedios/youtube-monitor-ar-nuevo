@@ -88,46 +88,67 @@ def obtener_datos_youtube():
     return pd.DataFrame(datos_videos)
 
 
-def procesar_metricas(df_hoy):
-    conn = sqlite3.connect(DB_NAME)
-    fecha_hoy = datetime.now().date().isoformat()
-    cursor = conn.cursor()
-    
-    vistas_totales_hoy = int(df_hoy['Vistas'].sum())
-    
-    # --- 1. Crecimiento del Canal ---
-    cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
-    row = cursor.fetchone()
-    
-    # CORRECCIÓN: Accedemos al primer elemento de la tupla row usando [0]
-    vistas_ayer = int(row[0]) if row else vistas_totales_hoy
-    crecimiento_total = vistas_totales_hoy - vistas_ayer
-    
-    conn.execute("INSERT INTO canal_history VALUES (?, ?)", (fecha_hoy, vistas_totales_hoy))
+def procesar_metricas(df_hoy, reintentos=1):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        fecha_hoy = datetime.now().date().isoformat()
+        cursor = conn.cursor()
+        
+        vistas_totales_hoy = int(df_hoy['Vistas'].sum())
+        
+        # --- 1. Crecimiento del Canal ---
+        cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
+        row = cursor.fetchone()
+        
+        # Leemos el dato; si es basura binaria, aquí saltará el ValueError
+        vistas_ayer = int(row[0]) if row else vistas_totales_hoy
+        crecimiento_total = vistas_totales_hoy - vistas_ayer
+        
+        conn.execute("INSERT INTO canal_history VALUES (?, ?)", (fecha_hoy, vistas_totales_hoy))
 
-    # --- 2. Crecimiento por Video ---
-    df_hoy['Crecimiento'] = 0
-    alertas = []
-    
-    for idx, row_v in df_hoy.iterrows():
-        cursor.execute("SELECT vistas FROM video_history WHERE video_id=? ORDER BY fecha DESC LIMIT 1", (row_v['ID'],))
-        res_v = cursor.fetchone()
+        # --- 2. Crecimiento por Video ---
+        df_hoy['Crecimiento'] = 0
+        alertas = []
         
-        if res_v:
-            # CORRECCIÓN: Accedemos al primer elemento de la tupla res_v usando [0]
-            vistas_ayer_v = int(res_v[0])
-            diff = int(row_v['Vistas']) - vistas_ayer_v
-            df_hoy.at[idx, 'Crecimiento'] = diff
+        for idx, row_v in df_hoy.iterrows():
+            cursor.execute("SELECT vistas FROM video_history WHERE video_id=? ORDER BY fecha DESC LIMIT 1", (row_v['ID'],))
+            res_v = cursor.fetchone()
             
-            if diff >= UMBRAL_VIRAL:
-                alertas.append(f"🚀 *VIRAL:* {row_v['Título']} (+{diff:,} vistas)")
+            if res_v:
+                # Si el registro del video está corrupto, también saltará aquí
+                vistas_ayer_v = int(res_v[0])
+                diff = int(row_v['Vistas']) - vistas_ayer_v
+                df_hoy.at[idx, 'Crecimiento'] = diff
+                
+                if diff >= UMBRAL_VIRAL:
+                    alertas.append(f"🚀 *VIRAL:* {row_v['Título']} (+{diff:,} vistas)")
+            
+            conn.execute("INSERT INTO video_history VALUES (?, ?, ?, ?)", 
+                         (row_v['ID'], row_v['Título'], int(row_v['Vistas']), fecha_hoy))
         
-        conn.execute("INSERT INTO video_history VALUES (?, ?, ?, ?)", 
-                     (row_v['ID'], row_v['Título'], int(row_v['Vistas']), fecha_hoy))
-    
-    conn.commit()
-    conn.close()
-    return crecimiento_total, alertas
+        conn.commit()
+        conn.close()
+        return crecimiento_total, alertas
+
+    except (ValueError, sqlite3.DatabaseError) as e:
+        # Si ocurre un error por corrupción, cerramos la conexión para liberar el archivo
+        conn.close()
+        
+        if reintentos > 0:
+            print(f"⚠️ BD corrupta detectada ({e}). Eliminando y reseteando...")
+            
+            # Eliminamos el archivo corrupto
+            if os.path.exists(DB_NAME):
+                os.remove(DB_NAME)
+            
+            # Volvemos a crear las tablas desde cero
+            init_db()
+            
+            # Reintentamos el proceso (pasando reintentos=0 para no hacer un bucle infinito)
+            return procesar_metricas(df_hoy, reintentos=0)
+        else:
+            # Si falla incluso después de limpiarlo, lanzamos la excepción
+            raise Exception(f"Fallo crítico al procesar métricas tras resetear la BD: {e}")
 
 
 def generar_grafico(df):
