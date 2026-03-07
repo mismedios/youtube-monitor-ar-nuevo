@@ -64,7 +64,6 @@ def git_push_db():
 
 def obtener_datos_youtube():
     youtube = build('youtube', 'v3', developerKey=API_KEY)
-    # CORRECCIÓN: Se agrega [0] para entrar al primer canal de la lista
     ch_res = youtube.channels().list(id=CHANNEL_ID, part='contentDetails').execute()
     uploads_id = ch_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
@@ -78,13 +77,18 @@ def obtener_datos_youtube():
 
     datos_videos = []
     for i in range(0, len(video_ids), 50):
-        v_res = youtube.videos().list(id=','.join(video_ids[i:i+50]), part='statistics,snippet').execute()
+        # Aquí es vital que part tenga 'statistics,snippet,contentDetails'
+        v_res = youtube.videos().list(id=','.join(video_ids[i:i+50]), part='statistics,snippet,contentDetails').execute()
         for item in v_res['items']:
             datos_videos.append({
                 'ID': item['id'],
                 'Título': item['snippet']['title'],
+                'Fecha Publicación': item['snippet'].get('publishedAt', '')[:10],
+                'Duración': item['contentDetails'].get('duration', ''),
                 'Vistas': int(item['statistics'].get('viewCount', 0)),
-                'URL': f"https://youtu.be{item['id']}"
+                'Me Gusta': int(item['statistics'].get('likeCount', 0)),
+                'Comentarios': int(item['statistics'].get('commentCount', 0)),
+                'URL': f"https://youtu.be/{item['id']}"
             })
     return pd.DataFrame(datos_videos)
 
