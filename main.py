@@ -99,7 +99,7 @@ def procesar_metricas(df_hoy):
     cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
     row = cursor.fetchone()
     
-    # CORRECCIÓN: Accedemos al primer elemento de la tupla row[0]
+    # CORRECCIÓN: Accedemos al primer elemento de la tupla row usando [0]
     vistas_ayer = int(row[0]) if row else vistas_totales_hoy
     crecimiento_total = vistas_totales_hoy - vistas_ayer
     
@@ -114,7 +114,7 @@ def procesar_metricas(df_hoy):
         res_v = cursor.fetchone()
         
         if res_v:
-            # CORRECCIÓN: Accedemos al primer elemento de la tupla res_v[0]
+            # CORRECCIÓN: Accedemos al primer elemento de la tupla res_v usando [0]
             vistas_ayer_v = int(res_v[0])
             diff = int(row_v['Vistas']) - vistas_ayer_v
             df_hoy.at[idx, 'Crecimiento'] = diff
@@ -128,6 +128,7 @@ def procesar_metricas(df_hoy):
     conn.commit()
     conn.close()
     return crecimiento_total, alertas
+
 
 def generar_grafico(df):
     top_5 = df.sort_values(by='Crecimiento', ascending=False).head(5)
