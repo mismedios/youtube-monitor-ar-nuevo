@@ -63,6 +63,7 @@ def git_push_db():
 
 def obtener_datos_youtube():
     youtube = build('youtube', 'v3', developerKey=API_KEY)
+    # CORRECCIÓN: Se agrega [0] para entrar al primer canal de la lista
     ch_res = youtube.channels().list(id=CHANNEL_ID, part='contentDetails').execute()
     uploads_id = ch_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
@@ -86,6 +87,7 @@ def obtener_datos_youtube():
             })
     return pd.DataFrame(datos_videos)
 
+
 def procesar_metricas(df_hoy):
     conn = sqlite3.connect(DB_NAME)
     fecha_hoy = datetime.now().date().isoformat()
@@ -95,8 +97,8 @@ def procesar_metricas(df_hoy):
     cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
     row = cursor.fetchone()
     
-    # CORRECCIÓN: Accedemos al primer elemento del registro y lo hacemos entero
-    vistas_ayer = int(row[0]) if row else vistas_totales_hoy
+    # CORRECCIÓN: Manejo seguro del valor de la base de datos
+    vistas_ayer = int(row[0]) if row and row[0] is not None else vistas_totales_hoy
     crecimiento_total = vistas_totales_hoy - vistas_ayer
     conn.execute("INSERT INTO canal_history VALUES (?, ?)", (fecha_hoy, vistas_totales_hoy))
 
@@ -106,8 +108,8 @@ def procesar_metricas(df_hoy):
         cursor.execute("SELECT vistas FROM video_history WHERE video_id=? ORDER BY fecha DESC LIMIT 1", (row_v['ID'],))
         res_v = cursor.fetchone()
         
-        if res_v:
-            # CORRECCIÓN: Accedemos al valor de la tabla y restamos como enteros
+        if res_v and res_v[0] is not None:
+            # CORRECCIÓN: Acceso al primer elemento de la tupla y conversión a int
             v_ayer = int(res_v[0])
             diff = int(row_v['Vistas']) - v_ayer
             df_hoy.at[idx, 'Crecimiento'] = diff
@@ -120,6 +122,7 @@ def procesar_metricas(df_hoy):
     conn.commit()
     conn.close()
     return crecimiento_total, alertas
+
 
 
 def generar_grafico(df):
