@@ -94,25 +94,31 @@ def procesar_metricas(df_hoy):
     cursor = conn.cursor()
     
     vistas_totales_hoy = int(df_hoy['Vistas'].sum())
+    
+    # --- 1. Crecimiento del Canal ---
     cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
     row = cursor.fetchone()
     
-    # CORRECCIÓN: Manejo seguro del valor de la base de datos
-    vistas_ayer = int(row[0]) if row and row[0] is not None else vistas_totales_hoy
+    # CORRECCIÓN: Accedemos al primer elemento de la tupla row[0]
+    vistas_ayer = int(row[0]) if row else vistas_totales_hoy
     crecimiento_total = vistas_totales_hoy - vistas_ayer
+    
     conn.execute("INSERT INTO canal_history VALUES (?, ?)", (fecha_hoy, vistas_totales_hoy))
 
+    # --- 2. Crecimiento por Video ---
     df_hoy['Crecimiento'] = 0
     alertas = []
+    
     for idx, row_v in df_hoy.iterrows():
         cursor.execute("SELECT vistas FROM video_history WHERE video_id=? ORDER BY fecha DESC LIMIT 1", (row_v['ID'],))
         res_v = cursor.fetchone()
         
-        if res_v and res_v[0] is not None:
-            # CORRECCIÓN: Acceso al primer elemento de la tupla y conversión a int
-            v_ayer = int(res_v[0])
-            diff = int(row_v['Vistas']) - v_ayer
+        if res_v:
+            # CORRECCIÓN: Accedemos al primer elemento de la tupla res_v[0]
+            vistas_ayer_v = int(res_v[0])
+            diff = int(row_v['Vistas']) - vistas_ayer_v
             df_hoy.at[idx, 'Crecimiento'] = diff
+            
             if diff >= UMBRAL_VIRAL:
                 alertas.append(f"🚀 *VIRAL:* {row_v['Título']} (+{diff:,} vistas)")
         
@@ -122,8 +128,6 @@ def procesar_metricas(df_hoy):
     conn.commit()
     conn.close()
     return crecimiento_total, alertas
-
-
 
 def generar_grafico(df):
     top_5 = df.sort_values(by='Crecimiento', ascending=False).head(5)
