@@ -18,7 +18,7 @@ TELEGRAM_CHAT_ID = str(os.getenv('TELEGRAM_CHAT_ID', '')).strip()
 CANALES = {
     "@TNTSportsAR": "UCI5RY8G0ar-hLIaUJvx58Lw", # Tu canal original
     "@ESPNFans": "UCFmMw7yTuLTCuMhpZD5dVsg", # Reemplazar por el ID real que necesites
-    "@LigaProfesional": "UC_f0pZidCOPlpAMoOsX6S6Q",
+    "@LigaProfesional": "UCJmCVoUfCBQb9lcfXIS8nXQ",
 }
 
 UMBRAL_VIRAL = 10000 
