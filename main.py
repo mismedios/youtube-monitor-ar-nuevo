@@ -9,41 +9,41 @@ from datetime import datetime
 from googleapiclient.discovery import build
 
 # --- CONFIGURACIÓN ---
-# Usamos strip() para limpiar cualquier espacio invisible de los Secrets
 API_KEY = str(os.getenv('YT_API_KEY', '')).strip()
 TELEGRAM_TOKEN = str(os.getenv('TELEGRAM_TOKEN', '')).strip()
 TELEGRAM_CHAT_ID = str(os.getenv('TELEGRAM_CHAT_ID', '')).strip()
 
-CHANNEL_ID = 'UC1Tw7oE-tWiA3qXEPpq9SWQ' 
-DB_NAME = "stats_history.db"
-UMBRAL_VIRAL = 10000 
+# --- DICCIONARIO DE CANALES ---
+# Reemplazá los "UC_ID..." por los IDs reales de los canales que querés monitorear.
+CANALES = {
+    "@TNTSportsAR": "UCI5RY8G0ar-hLIaUJvx58Lw", # Tu canal original
+    "@ESPNFans": "UCFmMw7yTuLTCuMhpZD5dVsg", # Reemplazar por el ID real que necesites
+    "@LigaProfesional": "UC_f0pZidCOPlpAMoOsX6S6Q",
+}
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
+UMBRAL_VIRAL = 10000 
+UMBRAL_LIKES = 500
+UMBRAL_COMENTARIOS = 100
+
+def init_db(db_name):
+    conn = sqlite3.connect(db_name)
     conn.execute('''CREATE TABLE IF NOT EXISTS canal_history (fecha TEXT, vistas_totales INTEGER)''')
-    # Actualizamos la estructura para incluir likes y comentarios
     conn.execute('''CREATE TABLE IF NOT EXISTS video_history (video_id TEXT, titulo TEXT, vistas INTEGER, likes INTEGER, comentarios INTEGER, fecha TEXT)''')
     conn.commit()
     conn.close()
 
 def enviar_telegram(mensaje, foto_path=None, archivo_path=None):
-    # La palabra "bot" debe ir pegada a la URL y ANTES del token
     base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-    
     try:
-        # 1. Enviar Foto
         if foto_path and os.path.exists(foto_path):
             with open(foto_path, 'rb') as f:
-                # Aquí la URL debe terminar en /sendPhoto
                 r = requests.post(f"{base_url}/sendPhoto", 
                                   data={'chat_id': TELEGRAM_CHAT_ID, 'caption': mensaje, 'parse_mode': 'Markdown'}, 
                                   files={'photo': f})
         else:
-            # Enviar solo texto si no hay foto
             r = requests.post(f"{base_url}/sendMessage", 
                               data={'chat_id': TELEGRAM_CHAT_ID, 'text': mensaje, 'parse_mode': 'Markdown'})
         
-        # 2. Enviar archivo Excel
         if archivo_path and os.path.exists(archivo_path):
             with open(archivo_path, 'rb') as f:
                 requests.post(f"{base_url}/sendDocument", data={'chat_id': TELEGRAM_CHAT_ID}, files={'document': f})
@@ -52,23 +52,29 @@ def enviar_telegram(mensaje, foto_path=None, archivo_path=None):
     except Exception as e:
         print(f"❌ Error al enviar a Telegram: {e}")
 
-def git_push_db():
+def git_push_db(lista_dbs):
     try:
         subprocess.run(["git", "config", "--global", "user.name", "YouTube Bot AR"], check=True)
         subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=True)
-        subprocess.run(["git", "add", DB_NAME], check=True)
-        subprocess.run(["git", "commit", "-m", f"🔄 Update DB: {datetime.now().date()}"], check=True)
+        
+        # Agregamos dinámicamente cada base de datos generada
+        for db in lista_dbs:
+            if os.path.exists(db):
+                subprocess.run(["git", "add", db], check=True)
+                
+        subprocess.run(["git", "commit", "-m", f"🔄 Update DBs: {datetime.now().date()}"], check=True)
         subprocess.run(["git", "push"], check=True)
-    except:
-        pass
+    except Exception as e:
+        print(f"No hay cambios para commitear o hubo un error en Git Push: {e}")
 
-def obtener_datos_youtube():
+def obtener_datos_youtube(channel_id):
     youtube = build('youtube', 'v3', developerKey=API_KEY)
-    ch_res = youtube.channels().list(id=CHANNEL_ID, part='contentDetails').execute()
+    ch_res = youtube.channels().list(id=channel_id, part='contentDetails').execute()
     uploads_id = ch_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
     video_ids = []
     next_page = None
+    # 4 iteraciones de 50 = últimos 200 videos por canal
     for _ in range(4):
         res = youtube.playlistItems().list(playlistId=uploads_id, part='contentDetails', maxResults=50, pageToken=next_page).execute()
         video_ids.extend([item['contentDetails']['videoId'] for item in res['items']])
@@ -77,7 +83,6 @@ def obtener_datos_youtube():
 
     datos_videos = []
     for i in range(0, len(video_ids), 50):
-        # Aquí es vital que part tenga 'statistics,snippet,contentDetails'
         v_res = youtube.videos().list(id=','.join(video_ids[i:i+50]), part='statistics,snippet,contentDetails').execute()
         for item in v_res['items']:
             datos_videos.append({
@@ -92,16 +97,14 @@ def obtener_datos_youtube():
             })
     return pd.DataFrame(datos_videos)
 
-
-def procesar_metricas(df_hoy, reintentos=1):
+def procesar_metricas(df_hoy, db_name, reintentos=1):
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(db_name)
         fecha_hoy = datetime.now().date().isoformat()
         cursor = conn.cursor()
         
         vistas_totales_hoy = int(df_hoy['Vistas'].sum())
         
-        # --- 1. Crecimiento del Canal ---
         cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
         row = cursor.fetchone()
         
@@ -110,18 +113,12 @@ def procesar_metricas(df_hoy, reintentos=1):
         
         conn.execute("INSERT INTO canal_history VALUES (?, ?)", (fecha_hoy, vistas_totales_hoy))
 
-        # --- 2. Crecimiento por Video ---
         df_hoy['Crecimiento'] = 0
         df_hoy['Crec_Likes'] = 0
         df_hoy['Crec_Comentarios'] = 0
         alertas = []
         
-        # --- UMBRALES DE ALERTAS (Ajustalos a tu gusto) ---
-        UMBRAL_LIKES = 500
-        UMBRAL_COMENTARIOS = 100
-        
         for idx, row_v in df_hoy.iterrows():
-            # Ahora pedimos vistas, likes y comentarios
             cursor.execute("SELECT vistas, likes, comentarios FROM video_history WHERE video_id=? ORDER BY fecha DESC LIMIT 1", (row_v['ID'],))
             res_v = cursor.fetchone()
             
@@ -138,7 +135,6 @@ def procesar_metricas(df_hoy, reintentos=1):
                 df_hoy.at[idx, 'Crec_Likes'] = diff_likes
                 df_hoy.at[idx, 'Crec_Comentarios'] = diff_comentarios
                 
-                # Generación de Alertas Múltiples
                 if diff_vistas >= UMBRAL_VIRAL:
                     alertas.append(f"🚀 *VIRAL:* {row_v['Título']} (+{diff_vistas:,} vistas)")
                 if diff_likes >= UMBRAL_LIKES:
@@ -146,7 +142,6 @@ def procesar_metricas(df_hoy, reintentos=1):
                 if diff_comentarios >= UMBRAL_COMENTARIOS:
                     alertas.append(f"💬 *DEBATE INTENSO:* {row_v['Título']} (+{diff_comentarios:,} comentarios)")
             
-            # Guardamos el registro con los 5 datos ahora
             conn.execute("INSERT INTO video_history VALUES (?, ?, ?, ?, ?, ?)", 
                          (row_v['ID'], row_v['Título'], int(row_v['Vistas']), int(row_v['Me Gusta']), int(row_v['Comentarios']), fecha_hoy))
         
@@ -154,23 +149,18 @@ def procesar_metricas(df_hoy, reintentos=1):
         conn.close()
         return crecimiento_total, alertas
 
-    # Agregamos sqlite3.OperationalError para que atrape el error de esquema viejo y resetee
     except (ValueError, sqlite3.DatabaseError, sqlite3.OperationalError) as e:
         conn.close()
-        
         if reintentos > 0:
-            print(f"⚠️ BD corrupta o desactualizada detectada ({e}). Eliminando y reseteando...")
-            
-            if os.path.exists(DB_NAME):
-                os.remove(DB_NAME)
-            
-            init_db()
-            return procesar_metricas(df_hoy, reintentos=0)
+            print(f"⚠️ BD corrupta o desactualizada detectada en {db_name} ({e}). Eliminando y reseteando...")
+            if os.path.exists(db_name):
+                os.remove(db_name)
+            init_db(db_name)
+            return procesar_metricas(df_hoy, db_name, reintentos=0)
         else:
-            raise Exception(f"Fallo crítico al procesar métricas tras resetear la BD: {e}")
+            raise Exception(f"Fallo crítico al procesar métricas en {db_name}: {e}")
 
-
-def generar_grafico(df):
+def generar_grafico(df, nombre_canal):
     top_5 = df.sort_values(by='Crecimiento', ascending=False).head(5)
     if top_5['Crecimiento'].sum() == 0:
         top_5 = df.sort_values(by='Vistas', ascending=False).head(5)
@@ -180,27 +170,50 @@ def generar_grafico(df):
     
     plt.figure(figsize=(10, 6))
     sns.barplot(x=col_x, y=top_5['Título'].str[:30], data=top_5, palette='viridis')
-    plt.title(f"Reporte YouTube AR - {datetime.now().strftime('%d/%m')}")
-    path = "grafico.png"
+    plt.title(f"Reporte {nombre_canal} - {datetime.now().strftime('%d/%m')}")
+    path = f"grafico_{nombre_canal}.png"
     plt.tight_layout()
     plt.savefig(path)
     plt.close()
     return path
 
 def main():
-    try:
-        init_db()
-        df = obtener_datos_youtube()
-        crec, virales = procesar_metricas(df)
-        img = generar_grafico(df)
-        excel = f"reporte_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        df.to_excel(excel, index=False)
+    dbs_procesadas = []
+    
+    for nombre_canal, channel_id in CANALES.items():
+        print(f"\n🔄 Procesando canal: {nombre_canal}...")
         
-        msg = f"🇦🇷 *REPORTE DIARIO*\n📈 Crecimiento: +{crec:,} vistas\n\n" + "\n".join(virales)
-        enviar_telegram(msg, foto_path=img, archivo_path=excel)
-        git_push_db()
-    except Exception as e:
-        print(f"Error en el Script: {e}")
+        try:
+            db_name = f"stats_{nombre_canal}.db"
+            excel_name = f"reporte_{nombre_canal}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            
+            # 1. Iniciar/Verificar BD
+            init_db(db_name)
+            
+            # 2. Descargar datos de este canal específico
+            df = obtener_datos_youtube(channel_id)
+            
+            # 3. Procesar métricas cruzando con la BD de este canal
+            crec, virales = procesar_metricas(df, db_name)
+            
+            # 4. Generar gráfico y guardar Excel
+            img = generar_grafico(df, nombre_canal)
+            df.to_excel(excel_name, index=False)
+            
+            # 5. Enviar a Telegram
+            msg = f"📺 *REPORTE DIARIO - {nombre_canal}*\n📈 Crecimiento: +{crec:,} vistas\n\n" + "\n".join(virales)
+            enviar_telegram(msg, foto_path=img, archivo_path=excel_name)
+            
+            # Registrar la BD para el push de Git
+            dbs_procesadas.append(db_name)
+            
+        except Exception as e:
+            print(f"❌ Error procesando {nombre_canal}: {e}")
+            enviar_telegram(f"⚠️ Error en el monitor del canal {nombre_canal}: {e}")
+            continue # Si un canal falla, el bot sigue con el siguiente
+            
+    # Al terminar todos los canales, subimos las bases de datos a GitHub
+    git_push_db(dbs_procesadas)
 
 if __name__ == "__main__":
     main()
