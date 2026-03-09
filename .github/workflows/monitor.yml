@@ -1,21 +1,16 @@
-name: Monitor YouTube Argentina Histórico
+name: Monitor YouTube Auto-Scrape (5 Minutos)
 on:
   schedule:
-    - cron: '0 12 * * *' # 09:00 AM Argentina
+    - cron: '*/5 * * * *' # Ejecuta cada 5 minutos
   workflow_dispatch:
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
-    # PERMISOS PARA QUE EL BOT PUEDA HACER PUSH
-    permissions:
-      contents: write
-      
+    
     steps:
       - name: Descargar código
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Descarga todo el historial para evitar conflictos de Git
 
       - name: Configurar Python
         uses: actions/setup-python@v4
@@ -23,13 +18,13 @@ jobs:
           python-version: '3.9'
 
       - name: Instalar dependencias
-        # Se agregaron matplotlib y seaborn a la lista de instalación
-        run: pip install pandas openpyxl google-api-python-client requests matplotlib seaborn
+        run: pip install pandas google-api-python-client requests gspread google-auth
 
-      - name: Ejecutar Script y Guardar Cambios
+      - name: Ejecutar Script de Extracción
         env:
           YT_API_KEY: ${{ secrets.YT_API_KEY }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Token automático de GitHub
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
         run: python main.py
