@@ -1,7 +1,7 @@
-name: Monitor YouTube Auto-Scrape (5 Minutos)
+name: Monitor YouTube Auto-Scrape (30 Minutos)
 on:
   schedule:
-    - cron: '*/5 * * * *' # Ejecuta cada 5 minutos
+    - cron: '*/30 * * * *' # Ejecuta cada 30 minutos
   workflow_dispatch:
 
 jobs:
@@ -18,7 +18,7 @@ jobs:
           python-version: '3.9'
 
       - name: Instalar dependencias
-        run: pip install pandas google-api-python-client requests gspread google-auth
+        run: pip install google-api-python-client requests gspread google-auth
 
       - name: Ejecutar Script de Extracción
         env:
