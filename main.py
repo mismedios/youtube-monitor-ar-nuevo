@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import re
 from datetime import datetime, timezone, timedelta
 from googleapiclient.discovery import build
 import gspread
@@ -24,15 +25,13 @@ DB_NAME = "youtube_unificada.db"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
-    # Tabla de datos de videos actualizada
+    # Agregamos el campo 'categoria' a la base de datos temporal
     conn.execute('''CREATE TABLE IF NOT EXISTS videos (
         id_video TEXT PRIMARY KEY, titulo TEXT, descripcion TEXT, fecha_publicacion TEXT, hora_publicacion TEXT, 
         duracion TEXT, vistas INTEGER, me_gusta INTEGER, comentarios INTEGER, 
-        url TEXT, miniatura TEXT, suscriptores INTEGER, fecha_scrapeo TEXT, hora_scrapeo TEXT, canal TEXT)''')
-    # Tabla de logs para el reporte diario
+        url TEXT, miniatura TEXT, suscriptores INTEGER, fecha_scrapeo TEXT, hora_scrapeo TEXT, canal TEXT, categoria TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS logs (
         fecha TEXT, hora TEXT, estado TEXT, mensaje TEXT)''')
-    # Tabla de control de reportes
     conn.execute('''CREATE TABLE IF NOT EXISTS control_reportes (fecha TEXT PRIMARY KEY)''')
     conn.commit()
     return conn
@@ -43,18 +42,49 @@ def log_ejecucion(conn, estado, mensaje):
                  (ahora_arg.strftime('%Y-%m-%d'), ahora_arg.strftime('%H:%M:%S'), estado, mensaje))
     conn.commit()
 
-def obtener_datos_youtube(channel_id, nombre_canal):
+def get_gspread_client():
+    if not GOOGLE_CREDENTIALS_JSON:
+        raise Exception("Faltan credenciales de Google Sheets.")
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return gspread.authorize(creds)
+
+def obtener_reglas_categorias():
+    try:
+        gc = get_gspread_client()
+        sheet = gc.open_by_key(SPREADSHEET_ID).worksheet("Categorias")
+        registros = sheet.get_all_records()
+        reglas = []
+        for fila in registros:
+            claves = str(fila.get('Palabras Clave', '')).split(',')
+            claves = [c.strip() for c in claves if c.strip()]
+            categoria = str(fila.get('Categoría', ''))
+            if claves and categoria:
+                reglas.append({'claves': claves, 'categoria': categoria})
+        return reglas
+    except Exception as e:
+        print(f"⚠️ No se pudo leer la pestaña 'Categorias' (se usará la categoría por defecto): {e}")
+        return []
+
+def clasificar_video(titulo, reglas):
+    for regla in reglas:
+        for clave in regla['claves']:
+            # Busca si la palabra clave está en el título, ignorando mayúsculas/minúsculas
+            if re.search(clave, titulo, re.IGNORECASE):
+                return regla['categoria']
+    return "Otros Partidos / General"
+
+def obtener_datos_youtube(channel_id, nombre_canal, reglas):
     youtube = build('youtube', 'v3', developerKey=API_KEY)
     
-    # 1. Obtener Suscriptores del canal
     ch_res = youtube.channels().list(id=channel_id, part='statistics,contentDetails').execute()
     suscriptores = int(ch_res['items'][0]['statistics'].get('subscriberCount', 0))
     uploads_id = ch_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
-    # 2. Obtener IDs de videos (Paginamos hasta traer ~250 videos)
     video_ids = []
     next_page = None
-    for _ in range(5): # 5 iteraciones de 50 = 250 videos
+    for _ in range(5): 
         res = youtube.playlistItems().list(
             playlistId=uploads_id, part='contentDetails', maxResults=50, pageToken=next_page
         ).execute()
@@ -63,7 +93,6 @@ def obtener_datos_youtube(channel_id, nombre_canal):
         if not next_page: 
             break
 
-    # 3. Obtener métricas de videos en lotes de 50
     datos_videos = []
     ahora_arg = datetime.now(timezone.utc) - timedelta(hours=3)
     fecha_scrapeo = ahora_arg.strftime('%Y-%m-%d')
@@ -74,18 +103,16 @@ def obtener_datos_youtube(channel_id, nombre_canal):
         v_res = youtube.videos().list(id=','.join(lote_ids), part='statistics,snippet,contentDetails').execute()
         
         for item in v_res['items']:
-            # Extraemos fecha y hora exactas de publicación
             fecha_hora_pub = item['snippet'].get('publishedAt', '')
             fecha_pub = fecha_hora_pub[:10] if fecha_hora_pub else ''
             hora_pub = fecha_hora_pub[11:19] if len(fecha_hora_pub) > 18 else ''
-            
-            # Buscamos la miniatura (thumbnail) en alta resolución
             miniatura = item['snippet']['thumbnails'].get('high', {}).get('url', '')
+            titulo = item['snippet']['title']
 
             datos_videos.append({
                 'ID del video': item['id'],
-                'Título del video': item['snippet']['title'],
-                'Descripcion del video': item['snippet']['description'][:500], # Limitamos a 500 chars para no saturar Sheets
+                'Título del video': titulo,
+                'Descripcion del video': item['snippet']['description'][:500],
                 'Fecha Publicación': fecha_pub,
                 'Hora Publicación': hora_pub,
                 'Duración del video': item['contentDetails'].get('duration', ''),
@@ -97,23 +124,16 @@ def obtener_datos_youtube(channel_id, nombre_canal):
                 'Suscriptores del canal': suscriptores,
                 'Fecha de scrapeo': fecha_scrapeo,
                 'Hora de scrapeo': hora_scrapeo,
-                'Canal': nombre_canal
+                'Canal': nombre_canal,
+                'Categoría': clasificar_video(titulo, reglas) # Acaba de ocurrir la magia
             })
             
     return datos_videos
 
 def subir_a_google_sheets(datos):
-    if not GOOGLE_CREDENTIALS_JSON or not SPREADSHEET_ID:
-        raise Exception("Faltan credenciales o ID de Google Sheets.")
-    
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    gc = gspread.authorize(creds)
-    
+    gc = get_gspread_client()
     sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
     
-    # Preparamos las filas con los nuevos campos
     filas = []
     for d in datos:
         filas.append([
@@ -121,7 +141,7 @@ def subir_a_google_sheets(datos):
             d['Fecha Publicación'], d['Hora Publicación'], d['Duración del video'], 
             d['Vistas del video'], d['Me Gusta del video'], d['Comentarios del video'],
             d['URL del video'], d['Miniatura'], d['Suscriptores del canal'],
-            d['Fecha de scrapeo'], d['Hora de scrapeo'], d['Canal']
+            d['Fecha de scrapeo'], d['Hora de scrapeo'], d['Canal'], d['Categoría']
         ])
     
     if filas:
@@ -136,12 +156,10 @@ def evaluar_reporte_diario(conn):
     fecha_hoy = ahora_arg.strftime('%Y-%m-%d')
     hora_actual = ahora_arg.hour
 
-    # Verificar si son pasadas las 10 AM y no se envió hoy
     if hora_actual >= 10:
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM control_reportes WHERE fecha=?", (fecha_hoy,))
         if not cursor.fetchone():
-            # Obtener métricas del día
             cursor.execute("SELECT COUNT(*) FROM logs WHERE fecha=? AND estado='EXITO'", (fecha_hoy,))
             ejecuciones_ok = cursor.fetchone()[0]
             
@@ -156,7 +174,6 @@ def evaluar_reporte_diario(conn):
             )
             enviar_telegram(msg)
             
-            # Registrar que ya se envió hoy
             conn.execute("INSERT INTO control_reportes VALUES (?)", (fecha_hoy,))
             conn.commit()
 
@@ -166,8 +183,11 @@ def main():
     errores = []
 
     try:
+        # 1. El bot lee tus reglas desde el Excel antes de extraer nada
+        reglas = obtener_reglas_categorias()
+        
         for nombre_canal, channel_id in CANALES.items():
-            datos_canal = obtener_datos_youtube(channel_id, nombre_canal)
+            datos_canal = obtener_datos_youtube(channel_id, nombre_canal, reglas)
             todos_los_datos.extend(datos_canal)
         
         if todos_los_datos:
