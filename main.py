@@ -1,219 +1,166 @@
 import os
 import sqlite3
-import subprocess
 import pandas as pd
-import requests
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from googleapiclient.discovery import build
+import gspread
+from google.oauth2.service_account import Credentials
+import json
+import requests
 
 # --- CONFIGURACIÓN ---
 API_KEY = str(os.getenv('YT_API_KEY', '')).strip()
 TELEGRAM_TOKEN = str(os.getenv('TELEGRAM_TOKEN', '')).strip()
 TELEGRAM_CHAT_ID = str(os.getenv('TELEGRAM_CHAT_ID', '')).strip()
+GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS', '').strip()
+SPREADSHEET_ID = str(os.getenv('SPREADSHEET_ID', '')).strip()
 
-# --- DICCIONARIO DE CANALES ---
-# Reemplazá los "UC_ID..." por los IDs reales de los canales que querés monitorear.
 CANALES = {
-    "@TNTSportsAR": "UCI5RY8G0ar-hLIaUJvx58Lw", # Tu canal original
-    "@ESPNFans": "UCFmMw7yTuLTCuMhpZD5dVsg", # Reemplazar por el ID real que necesites
+    "@TNTSportsAR": "UCI5RY8G0ar-hLIaUJvx58Lw",
+    "@ESPNFans": "UCFmMw7yTuLTCuMhpZD5dVsg",
     "@LigaProfesional": "UCJmCVoUfCBQb9lcfXIS8nXQ",
 }
 
-UMBRAL_VIRAL = 10000 
-UMBRAL_LIKES = 500
-UMBRAL_COMENTARIOS = 100
+DB_NAME = "youtube_unificada.db"
 
-def init_db(db_name):
-    conn = sqlite3.connect(db_name)
-    conn.execute('''CREATE TABLE IF NOT EXISTS canal_history (fecha TEXT, vistas_totales INTEGER)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS video_history (video_id TEXT, titulo TEXT, vistas INTEGER, likes INTEGER, comentarios INTEGER, fecha TEXT)''')
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    # Tabla de datos de videos
+    conn.execute('''CREATE TABLE IF NOT EXISTS videos (
+        id_video TEXT PRIMARY KEY, titulo TEXT, descripcion TEXT, fecha_publicacion TEXT, 
+        duracion TEXT, vistas INTEGER, me_gusta INTEGER, no_me_gusta TEXT, comentarios INTEGER, 
+        shares TEXT, url TEXT, suscriptores INTEGER, fecha_scrapeo TEXT, hora_scrapeo TEXT, canal TEXT)''')
+    # Tabla de logs para el reporte diario
+    conn.execute('''CREATE TABLE IF NOT EXISTS logs (
+        fecha TEXT, hora TEXT, estado TEXT, mensaje TEXT)''')
+    # Tabla de control de reportes
+    conn.execute('''CREATE TABLE IF NOT EXISTS control_reportes (fecha TEXT PRIMARY KEY)''')
     conn.commit()
-    conn.close()
+    return conn
 
-def enviar_telegram(mensaje, foto_path=None, archivo_path=None):
-    base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-    try:
-        if foto_path and os.path.exists(foto_path):
-            with open(foto_path, 'rb') as f:
-                r = requests.post(f"{base_url}/sendPhoto", 
-                                  data={'chat_id': TELEGRAM_CHAT_ID, 'caption': mensaje, 'parse_mode': 'Markdown'}, 
-                                  files={'photo': f})
-        else:
-            r = requests.post(f"{base_url}/sendMessage", 
-                              data={'chat_id': TELEGRAM_CHAT_ID, 'text': mensaje, 'parse_mode': 'Markdown'})
-        
-        if archivo_path and os.path.exists(archivo_path):
-            with open(archivo_path, 'rb') as f:
-                requests.post(f"{base_url}/sendDocument", data={'chat_id': TELEGRAM_CHAT_ID}, files={'document': f})
-        
-        print(f"Telegram status: {r.status_code}")
-    except Exception as e:
-        print(f"❌ Error al enviar a Telegram: {e}")
+def log_ejecucion(conn, estado, mensaje):
+    ahora_arg = datetime.now(timezone.utc) - timedelta(hours=3)
+    conn.execute("INSERT INTO logs VALUES (?, ?, ?, ?)", 
+                 (ahora_arg.strftime('%Y-%m-%d'), ahora_arg.strftime('%H:%M:%S'), estado, mensaje))
+    conn.commit()
 
-def git_push_db(lista_dbs):
-    try:
-        subprocess.run(["git", "config", "--global", "user.name", "YouTube Bot AR"], check=True)
-        subprocess.run(["git", "config", "--global", "user.email", "bot@github.com"], check=True)
-        
-        # Agregamos dinámicamente cada base de datos generada
-        for db in lista_dbs:
-            if os.path.exists(db):
-                subprocess.run(["git", "add", db], check=True)
-                
-        subprocess.run(["git", "commit", "-m", f"🔄 Update DBs: {datetime.now().date()}"], check=True)
-        subprocess.run(["git", "push"], check=True)
-    except Exception as e:
-        print(f"No hay cambios para commitear o hubo un error en Git Push: {e}")
-
-def obtener_datos_youtube(channel_id):
+def obtener_datos_youtube(channel_id, nombre_canal):
     youtube = build('youtube', 'v3', developerKey=API_KEY)
-    ch_res = youtube.channels().list(id=channel_id, part='contentDetails').execute()
+    
+    # 1. Obtener Suscriptores del canal
+    ch_res = youtube.channels().list(id=channel_id, part='statistics,contentDetails').execute()
+    suscriptores = int(ch_res['items'][0]['statistics'].get('subscriberCount', 0))
     uploads_id = ch_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
-    video_ids = []
-    next_page = None
-    # 4 iteraciones de 50 = últimos 200 videos por canal
-    for _ in range(4):
-        res = youtube.playlistItems().list(playlistId=uploads_id, part='contentDetails', maxResults=50, pageToken=next_page).execute()
-        video_ids.extend([item['contentDetails']['videoId'] for item in res['items']])
-        next_page = res.get('nextPageToken')
-        if not next_page: break
+    # 2. Obtener IDs de videos (últimos 50 para hacerlo rápido cada 5 min)
+    res = youtube.playlistItems().list(playlistId=uploads_id, part='contentDetails', maxResults=50).execute()
+    video_ids = [item['contentDetails']['videoId'] for item in res['items']]
 
+    # 3. Obtener métricas de videos
     datos_videos = []
-    for i in range(0, len(video_ids), 50):
-        v_res = youtube.videos().list(id=','.join(video_ids[i:i+50]), part='statistics,snippet,contentDetails').execute()
+    ahora_arg = datetime.now(timezone.utc) - timedelta(hours=3)
+    fecha_scrapeo = ahora_arg.strftime('%Y-%m-%d')
+    hora_scrapeo = ahora_arg.strftime('%H:%M:%S')
+
+    if video_ids:
+        v_res = youtube.videos().list(id=','.join(video_ids), part='statistics,snippet,contentDetails').execute()
         for item in v_res['items']:
             datos_videos.append({
-                'ID': item['id'],
-                'Título': item['snippet']['title'],
-                'Fecha Publicación': item['snippet'].get('publishedAt', '')[:10],
-                'Duración': item['contentDetails'].get('duration', ''),
-                'Vistas': int(item['statistics'].get('viewCount', 0)),
-                'Me Gusta': int(item['statistics'].get('likeCount', 0)),
-                'Comentarios': int(item['statistics'].get('commentCount', 0)),
-                'URL': f"https://youtu.be/{item['id']}"
+                'ID del video': item['id'],
+                'Título del video': item['snippet']['title'],
+                'Descripcion del video': item['snippet']['description'][:500], # Limitamos a 500 chars para no saturar
+                'Fecha Publicación el video': item['snippet'].get('publishedAt', '')[:10],
+                'Duración del video': item['contentDetails'].get('duration', ''),
+                'Vistas del video': int(item['statistics'].get('viewCount', 0)),
+                'Me Gusta del video': int(item['statistics'].get('likeCount', 0)),
+                'No Me Gusta del video': 'N/A', # API no lo provee públicamente
+                'Comentarios del video': int(item['statistics'].get('commentCount', 0)),
+                'Shares del video': 'N/A', # API no lo provee
+                'URL del video': f"https://youtu.be/{item['id']}",
+                'Suscriptores del canal': suscriptores,
+                'Fecha de scrapeo de datos': fecha_scrapeo,
+                'Hora de scrapeo de datos': hora_scrapeo,
+                'Canal': nombre_canal
             })
-    return pd.DataFrame(datos_videos)
+    return datos_videos
 
-def procesar_metricas(df_hoy, db_name, reintentos=1):
-    try:
-        conn = sqlite3.connect(db_name)
-        fecha_hoy = datetime.now().date().isoformat()
-        cursor = conn.cursor()
-        
-        vistas_totales_hoy = int(df_hoy['Vistas'].sum())
-        
-        cursor.execute("SELECT vistas_totales FROM canal_history ORDER BY fecha DESC LIMIT 1")
-        row = cursor.fetchone()
-        
-        vistas_ayer = int(row[0]) if row else vistas_totales_hoy
-        crecimiento_total = vistas_totales_hoy - vistas_ayer
-        
-        conn.execute("INSERT INTO canal_history VALUES (?, ?)", (fecha_hoy, vistas_totales_hoy))
-
-        df_hoy['Crecimiento'] = 0
-        df_hoy['Crec_Likes'] = 0
-        df_hoy['Crec_Comentarios'] = 0
-        alertas = []
-        
-        for idx, row_v in df_hoy.iterrows():
-            cursor.execute("SELECT vistas, likes, comentarios FROM video_history WHERE video_id=? ORDER BY fecha DESC LIMIT 1", (row_v['ID'],))
-            res_v = cursor.fetchone()
-            
-            if res_v:
-                vistas_ayer_v = int(res_v[0])
-                likes_ayer_v = int(res_v[1]) if res_v[1] is not None else int(row_v['Me Gusta'])
-                comentarios_ayer_v = int(res_v[2]) if res_v[2] is not None else int(row_v['Comentarios'])
-                
-                diff_vistas = int(row_v['Vistas']) - vistas_ayer_v
-                diff_likes = int(row_v['Me Gusta']) - likes_ayer_v
-                diff_comentarios = int(row_v['Comentarios']) - comentarios_ayer_v
-                
-                df_hoy.at[idx, 'Crecimiento'] = diff_vistas
-                df_hoy.at[idx, 'Crec_Likes'] = diff_likes
-                df_hoy.at[idx, 'Crec_Comentarios'] = diff_comentarios
-                
-                if diff_vistas >= UMBRAL_VIRAL:
-                    alertas.append(f"🚀 *VIRAL:* {row_v['Título']} (+{diff_vistas:,} vistas)")
-                if diff_likes >= UMBRAL_LIKES:
-                    alertas.append(f"❤️ *LLUVIA DE LIKES:* {row_v['Título']} (+{diff_likes:,} likes)")
-                if diff_comentarios >= UMBRAL_COMENTARIOS:
-                    alertas.append(f"💬 *DEBATE INTENSO:* {row_v['Título']} (+{diff_comentarios:,} comentarios)")
-            
-            conn.execute("INSERT INTO video_history VALUES (?, ?, ?, ?, ?, ?)", 
-                         (row_v['ID'], row_v['Título'], int(row_v['Vistas']), int(row_v['Me Gusta']), int(row_v['Comentarios']), fecha_hoy))
-        
-        conn.commit()
-        conn.close()
-        return crecimiento_total, alertas
-
-    except (ValueError, sqlite3.DatabaseError, sqlite3.OperationalError) as e:
-        conn.close()
-        if reintentos > 0:
-            print(f"⚠️ BD corrupta o desactualizada detectada en {db_name} ({e}). Eliminando y reseteando...")
-            if os.path.exists(db_name):
-                os.remove(db_name)
-            init_db(db_name)
-            return procesar_metricas(df_hoy, db_name, reintentos=0)
-        else:
-            raise Exception(f"Fallo crítico al procesar métricas en {db_name}: {e}")
-
-def generar_grafico(df, nombre_canal):
-    top_5 = df.sort_values(by='Crecimiento', ascending=False).head(5)
-    if top_5['Crecimiento'].sum() == 0:
-        top_5 = df.sort_values(by='Vistas', ascending=False).head(5)
-        col_x = 'Vistas'
-    else:
-        col_x = 'Crecimiento'
+def subir_a_google_sheets(datos):
+    if not GOOGLE_CREDENTIALS_JSON or not SPREADSHEET_ID:
+        raise Exception("Faltan credenciales o ID de Google Sheets.")
     
-    plt.figure(figsize=(10, 6))
-    sns.barplot(x=col_x, y=top_5['Título'].str[:30], data=top_5, palette='viridis')
-    plt.title(f"Reporte {nombre_canal} - {datetime.now().strftime('%d/%m')}")
-    path = f"grafico_{nombre_canal}.png"
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
-    return path
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    gc = gspread.authorize(creds)
+    
+    sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+    
+    # Preparamos las filas. Aseguramos el orden pedido.
+    filas = []
+    for d in datos:
+        filas.append([
+            d['ID del video'], d['Título del video'], d['Descripcion del video'],
+            d['Fecha Publicación el video'], d['Duración del video'], d['Vistas del video'],
+            d['Me Gusta del video'], d['No Me Gusta del video'], d['Comentarios del video'],
+            d['Shares del video'], d['URL del video'], d['Suscriptores del canal'],
+            d['Fecha de scrapeo de datos'], d['Hora de scrapeo de datos']
+        ])
+    
+    if filas:
+        sheet.append_rows(filas, value_input_option='USER_ENTERED')
+
+def enviar_telegram(mensaje):
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(base_url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': mensaje, 'parse_mode': 'Markdown'})
+
+def evaluar_reporte_diario(conn):
+    ahora_arg = datetime.now(timezone.utc) - timedelta(hours=3)
+    fecha_hoy = ahora_arg.strftime('%Y-%m-%d')
+    hora_actual = ahora_arg.hour
+
+    # Verificar si son pasadas las 10 AM y no se envió hoy
+    if hora_actual >= 10:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM control_reportes WHERE fecha=?", (fecha_hoy,))
+        if not cursor.fetchone():
+            # Obtener métricas del día
+            cursor.execute("SELECT COUNT(*) FROM logs WHERE fecha=? AND estado='EXITO'", (fecha_hoy,))
+            ejecuciones_ok = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM logs WHERE fecha=? AND estado='ERROR'", (fecha_hoy,))
+            ejecuciones_error = cursor.fetchone()[0]
+            
+            msg = (
+                f"📊 *REPORTE DIARIO DE SCRAPING - 10:00 HS*\n\n"
+                f"✅ Ejecuciones exitosas hoy: {ejecuciones_ok}\n"
+                f"❌ Ejecuciones con errores: {ejecuciones_error}\n\n"
+                f"⚙️ *Estado:* {'🟢 Todo operando normal' if ejecuciones_error == 0 else '🔴 Hubo problemas, revisar logs.'}"
+            )
+            enviar_telegram(msg)
+            
+            # Registrar que ya se envió hoy
+            conn.execute("INSERT INTO control_reportes VALUES (?)", (fecha_hoy,))
+            conn.commit()
 
 def main():
-    dbs_procesadas = []
-    
-    for nombre_canal, channel_id in CANALES.items():
-        print(f"\n🔄 Procesando canal: {nombre_canal}...")
+    conn = init_db()
+    todos_los_datos = []
+    errores = []
+
+    try:
+        for nombre_canal, channel_id in CANALES.items():
+            datos_canal = obtener_datos_youtube(channel_id, nombre_canal)
+            todos_los_datos.extend(datos_canal)
         
-        try:
-            db_name = f"stats_{nombre_canal}.db"
-            excel_name = f"reporte_{nombre_canal}_{datetime.now().strftime('%Y%m%d')}.xlsx"
-            
-            # 1. Iniciar/Verificar BD
-            init_db(db_name)
-            
-            # 2. Descargar datos de este canal específico
-            df = obtener_datos_youtube(channel_id)
-            
-            # 3. Procesar métricas cruzando con la BD de este canal
-            crec, virales = procesar_metricas(df, db_name)
-            
-            # 4. Generar gráfico y guardar Excel
-            img = generar_grafico(df, nombre_canal)
-            df.to_excel(excel_name, index=False)
-            
-            # 5. Enviar a Telegram
-            msg = f"📺 *REPORTE DIARIO - {nombre_canal}*\n📈 Crecimiento: +{crec:,} vistas\n\n" + "\n".join(virales)
-            enviar_telegram(msg, foto_path=img, archivo_path=excel_name)
-            
-            # Registrar la BD para el push de Git
-            dbs_procesadas.append(db_name)
-            
-        except Exception as e:
-            print(f"❌ Error procesando {nombre_canal}: {e}")
-            enviar_telegram(f"⚠️ Error en el monitor del canal {nombre_canal}: {e}")
-            continue # Si un canal falla, el bot sigue con el siguiente
-            
-    # Al terminar todos los canales, subimos las bases de datos a GitHub
-    git_push_db(dbs_procesadas)
+        if todos_los_datos:
+            subir_a_google_sheets(todos_los_datos)
+            log_ejecucion(conn, 'EXITO', f'Se scrapearon y enviaron {len(todos_los_datos)} videos a GSheets.')
+    except Exception as e:
+        errores.append(str(e))
+        log_ejecucion(conn, 'ERROR', str(e))
+
+    evaluar_reporte_diario(conn)
+    conn.close()
 
 if __name__ == "__main__":
     main()
