@@ -25,11 +25,14 @@ DB_NAME = "youtube_unificada.db"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
-    # Agregamos el campo 'categoria' y el nuevo campo 'tipo' a la base de datos temporal
+    # Se reemplazó espectadores por fin_live y duracion_live
     conn.execute('''CREATE TABLE IF NOT EXISTS videos (
         id_video TEXT PRIMARY KEY, titulo TEXT, descripcion TEXT, fecha_publicacion TEXT, hora_publicacion TEXT, 
         duracion TEXT, vistas INTEGER, me_gusta INTEGER, comentarios INTEGER, 
-        url TEXT, miniatura TEXT, suscriptores INTEGER, fecha_scrapeo TEXT, hora_scrapeo TEXT, canal TEXT, categoria TEXT, tipo TEXT)''')
+        url TEXT, miniatura TEXT, suscriptores INTEGER, fecha_scrapeo TEXT, hora_scrapeo TEXT, canal TEXT, 
+        categoria TEXT, tipo TEXT, keywords_canal TEXT, total_videos_canal INTEGER, 
+        prom_videos_diario REAL, prom_videos_semanal REAL, prom_videos_mensual REAL,
+        inicio_live TEXT, fin_live TEXT, duracion_live TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS logs (
         fecha TEXT, hora TEXT, estado TEXT, mensaje TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS control_reportes (fecha TEXT PRIMARY KEY)''')
@@ -64,13 +67,12 @@ def obtener_reglas_categorias():
                 reglas.append({'claves': claves, 'categoria': categoria})
         return reglas
     except Exception as e:
-        print(f"⚠️ No se pudo leer la pestaña 'Categorias' (se usará la categoría por defecto): {e}")
+        print(f"⚠️ No se pudo leer la pestaña 'Categorias': {e}")
         return []
 
 def clasificar_video(titulo, reglas):
     for regla in reglas:
         for clave in regla['claves']:
-            # Busca si la palabra clave está en el título, ignorando mayúsculas/minúsculas
             if re.search(clave, titulo, re.IGNORECASE):
                 return regla['categoria']
     return "Otros Partidos / General"
@@ -78,9 +80,26 @@ def clasificar_video(titulo, reglas):
 def obtener_datos_youtube(channel_id, nombre_canal, reglas):
     youtube = build('youtube', 'v3', developerKey=API_KEY)
     
-    ch_res = youtube.channels().list(id=channel_id, part='statistics,contentDetails').execute()
-    suscriptores = int(ch_res['items'][0]['statistics'].get('subscriberCount', 0))
-    uploads_id = ch_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+    ch_res = youtube.channels().list(id=channel_id, part='statistics,contentDetails,brandingSettings,snippet').execute()
+    item_canal = ch_res['items'][0]
+    
+    suscriptores = int(item_canal['statistics'].get('subscriberCount', 0))
+    total_videos = int(item_canal['statistics'].get('videoCount', 0))
+    keywords_canal = item_canal.get('brandingSettings', {}).get('channel', {}).get('keywords', '')
+    fecha_creacion_canal = item_canal['snippet'].get('publishedAt', '')[:10]
+    uploads_id = item_canal['contentDetails']['relatedPlaylists']['uploads']
+
+    try:
+        fecha_creacion_dt = datetime.strptime(fecha_creacion_canal, "%Y-%m-%d")
+        dias_antiguedad = (datetime.now() - fecha_creacion_dt).days
+        if dias_antiguedad > 0:
+            prom_diario = round(total_videos / dias_antiguedad, 2)
+            prom_semanal = round(prom_diario * 7, 2)
+            prom_mensual = round(prom_diario * 30.44, 2)
+        else:
+            prom_diario = prom_semanal = prom_mensual = 0
+    except Exception:
+        prom_diario = prom_semanal = prom_mensual = 0
 
     video_ids = []
     next_page = None
@@ -100,7 +119,6 @@ def obtener_datos_youtube(channel_id, nombre_canal, reglas):
 
     for i in range(0, len(video_ids), 50):
         lote_ids = video_ids[i:i+50]
-        # AGREGADO: liveStreamingDetails a la petición part
         v_res = youtube.videos().list(id=','.join(lote_ids), part='statistics,snippet,contentDetails,liveStreamingDetails').execute()
         
         for item in v_res['items']:
@@ -111,9 +129,39 @@ def obtener_datos_youtube(channel_id, nombre_canal, reglas):
             titulo = item['snippet']['title']
             duracion_iso = item['contentDetails'].get('duration', '')
 
-            # --- LÓGICA DE CLASIFICACIÓN DE TIPO (Live, Short, On Demand) ---
-            tipo_video = "On Demand"
+            # --- EXTRACCIÓN Y CÁLCULO DE DATOS LIVE ---
+            live_details = item.get('liveStreamingDetails', {})
+            inicio_live_raw = live_details.get('actualStartTime', '')
+            fin_live_raw = live_details.get('actualEndTime', '')
             
+            inicio_live_str = ""
+            fin_live_str = ""
+            duracion_live = ""
+
+            # Calcular duración si existen ambos datos
+            if inicio_live_raw and fin_live_raw:
+                try:
+                    # Cortamos los primeros 19 caracteres (YYYY-MM-DDTHH:MM:SS) para evitar errores de zona horaria (la Z)
+                    dt_inicio = datetime.strptime(inicio_live_raw[:19], "%Y-%m-%dT%H:%M:%S")
+                    dt_fin = datetime.strptime(fin_live_raw[:19], "%Y-%m-%dT%H:%M:%S")
+                    duracion_td = dt_fin - dt_inicio
+                    
+                    # Convertir a formato legible HH:MM:SS
+                    total_seconds = int(duracion_td.total_seconds())
+                    hours, remainder = divmod(total_seconds, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    duracion_live = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                except Exception:
+                    duracion_live = ""
+
+            # Limpiar formatos para enviar a sheets
+            if inicio_live_raw:
+                inicio_live_str = inicio_live_raw[:10] + " " + inicio_live_raw[11:19]
+            if fin_live_raw:
+                fin_live_str = fin_live_raw[:10] + " " + fin_live_raw[11:19]
+
+            # --- LÓGICA DE CLASIFICACIÓN DE TIPO ---
+            tipo_video = "On Demand"
             if 'liveStreamingDetails' in item:
                 tipo_video = "Live"
             else:
@@ -144,7 +192,16 @@ def obtener_datos_youtube(channel_id, nombre_canal, reglas):
                 'Hora de scrapeo': hora_scrapeo,
                 'Canal': nombre_canal,
                 'Categoría': clasificar_video(titulo, reglas),
-                'Tipo': tipo_video # Nueva clave agregada
+                'Tipo': tipo_video,
+                'Keywords Canal': keywords_canal,
+                'Total Videos Canal': total_videos,
+                'Promedio Videos Diario': prom_diario,
+                'Promedio Videos Semanal': prom_semanal,
+                'Promedio Videos Mensual': prom_mensual,
+                # Variables actualizadas
+                'Inicio Live': inicio_live_str,
+                'Fin Live': fin_live_str,
+                'Duración Live': duracion_live
             })
             
     return datos_videos
@@ -160,8 +217,11 @@ def subir_a_google_sheets(datos):
             d['Fecha Publicación'], d['Hora Publicación'], d['Duración del video'], 
             d['Vistas del video'], d['Me Gusta del video'], d['Comentarios del video'],
             d['URL del video'], d['Miniatura'], d['Suscriptores del canal'],
-            d['Fecha de scrapeo'], d['Hora de scrapeo'], d['Canal'], d['Categoría'],
-            d['Tipo'] # Nuevo dato enviado a Google Sheets
+            d['Fecha de scrapeo'], d['Hora de scrapeo'], d['Canal'], d['Categoría'], d['Tipo'],
+            d['Keywords Canal'], d['Total Videos Canal'], d['Promedio Videos Diario'], 
+            d['Promedio Videos Semanal'], d['Promedio Videos Mensual'], 
+            # Se enviarán estas columnas al final
+            d['Inicio Live'], d['Fin Live'], d['Duración Live']
         ])
     
     if filas:
@@ -203,7 +263,6 @@ def main():
     errores = []
 
     try:
-        # 1. El bot lee tus reglas desde el Excel antes de extraer nada
         reglas = obtener_reglas_categorias()
         
         for nombre_canal, channel_id in CANALES.items():
