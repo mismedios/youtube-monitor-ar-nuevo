@@ -25,11 +25,11 @@ DB_NAME = "youtube_unificada.db"
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
-    # Agregamos el campo 'categoria' a la base de datos temporal
+    # Agregamos el campo 'categoria' y el nuevo campo 'tipo' a la base de datos temporal
     conn.execute('''CREATE TABLE IF NOT EXISTS videos (
         id_video TEXT PRIMARY KEY, titulo TEXT, descripcion TEXT, fecha_publicacion TEXT, hora_publicacion TEXT, 
         duracion TEXT, vistas INTEGER, me_gusta INTEGER, comentarios INTEGER, 
-        url TEXT, miniatura TEXT, suscriptores INTEGER, fecha_scrapeo TEXT, hora_scrapeo TEXT, canal TEXT, categoria TEXT)''')
+        url TEXT, miniatura TEXT, suscriptores INTEGER, fecha_scrapeo TEXT, hora_scrapeo TEXT, canal TEXT, categoria TEXT, tipo TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS logs (
         fecha TEXT, hora TEXT, estado TEXT, mensaje TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS control_reportes (fecha TEXT PRIMARY KEY)''')
@@ -100,7 +100,8 @@ def obtener_datos_youtube(channel_id, nombre_canal, reglas):
 
     for i in range(0, len(video_ids), 50):
         lote_ids = video_ids[i:i+50]
-        v_res = youtube.videos().list(id=','.join(lote_ids), part='statistics,snippet,contentDetails').execute()
+        # AGREGADO: liveStreamingDetails a la petición part
+        v_res = youtube.videos().list(id=','.join(lote_ids), part='statistics,snippet,contentDetails,liveStreamingDetails').execute()
         
         for item in v_res['items']:
             fecha_hora_pub = item['snippet'].get('publishedAt', '')
@@ -108,6 +109,23 @@ def obtener_datos_youtube(channel_id, nombre_canal, reglas):
             hora_pub = fecha_hora_pub[11:19] if len(fecha_hora_pub) > 18 else ''
             miniatura = item['snippet']['thumbnails'].get('high', {}).get('url', '')
             titulo = item['snippet']['title']
+            duracion_iso = item['contentDetails'].get('duration', '')
+
+            # --- LÓGICA DE CLASIFICACIÓN DE TIPO (Live, Short, On Demand) ---
+            tipo_video = "On Demand"
+            
+            if 'liveStreamingDetails' in item:
+                tipo_video = "Live"
+            else:
+                es_short = False
+                if 'H' not in duracion_iso: 
+                    if 'M' not in duracion_iso: 
+                        es_short = True
+                    elif duracion_iso == 'PT1M' or duracion_iso == 'PT1M0S': 
+                        es_short = True
+                
+                if es_short:
+                    tipo_video = "Short"
 
             datos_videos.append({
                 'ID del video': item['id'],
@@ -115,7 +133,7 @@ def obtener_datos_youtube(channel_id, nombre_canal, reglas):
                 'Descripcion del video': item['snippet']['description'][:500],
                 'Fecha Publicación': fecha_pub,
                 'Hora Publicación': hora_pub,
-                'Duración del video': item['contentDetails'].get('duration', ''),
+                'Duración del video': duracion_iso,
                 'Vistas del video': int(item['statistics'].get('viewCount', 0)),
                 'Me Gusta del video': int(item['statistics'].get('likeCount', 0)),
                 'Comentarios del video': int(item['statistics'].get('commentCount', 0)),
@@ -125,7 +143,8 @@ def obtener_datos_youtube(channel_id, nombre_canal, reglas):
                 'Fecha de scrapeo': fecha_scrapeo,
                 'Hora de scrapeo': hora_scrapeo,
                 'Canal': nombre_canal,
-                'Categoría': clasificar_video(titulo, reglas) # Acaba de ocurrir la magia
+                'Categoría': clasificar_video(titulo, reglas),
+                'Tipo': tipo_video # Nueva clave agregada
             })
             
     return datos_videos
@@ -141,7 +160,8 @@ def subir_a_google_sheets(datos):
             d['Fecha Publicación'], d['Hora Publicación'], d['Duración del video'], 
             d['Vistas del video'], d['Me Gusta del video'], d['Comentarios del video'],
             d['URL del video'], d['Miniatura'], d['Suscriptores del canal'],
-            d['Fecha de scrapeo'], d['Hora de scrapeo'], d['Canal'], d['Categoría']
+            d['Fecha de scrapeo'], d['Hora de scrapeo'], d['Canal'], d['Categoría'],
+            d['Tipo'] # Nuevo dato enviado a Google Sheets
         ])
     
     if filas:
